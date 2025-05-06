@@ -267,3 +267,79 @@
     (err err-vehicle-not-found)
   )
 )
+
+
+
+(define-map maintenance-schedule
+  { vin: (string-ascii 17), service-type: (string-ascii 50) }
+  {
+    interval-miles: uint,
+    last-service: uint,
+    next-due: uint
+  }
+)
+
+
+(define-public (set-maintenance-schedule 
+    (vin (string-ascii 17))
+    (service-type (string-ascii 50))
+    (interval-miles uint))
+  (match (map-get? vehicles { vin: vin })
+    vehicle 
+      (if (is-eq tx-sender (get owner vehicle))
+          (begin
+            (map-set maintenance-schedule
+              { vin: vin, service-type: service-type }
+              {
+                interval-miles: interval-miles,
+                last-service: (get current-odometer vehicle),
+                next-due: (+ (get current-odometer vehicle) interval-miles)
+              }
+            )
+            (ok true))
+          (err err-not-owner))
+    (err err-vehicle-not-found)))
+
+
+(define-map vehicle-valuations
+  { vin: (string-ascii 17) }
+  {
+    initial-value: uint,
+    annual-depreciation-rate: uint,
+    accident-penalty: uint
+  }
+)
+
+(define-public (set-vehicle-valuation
+    (vin (string-ascii 17))
+    (initial-value uint)
+    (annual-depreciation-rate uint)
+    (accident-penalty uint))
+  (match (map-get? vehicles { vin: vin })
+    vehicle
+      (if (is-eq tx-sender (get owner vehicle))
+          (begin
+            (map-set vehicle-valuations
+              { vin: vin }
+              {
+                initial-value: initial-value,
+                annual-depreciation-rate: annual-depreciation-rate,
+                accident-penalty: accident-penalty
+              }
+            )
+            (ok true))
+          (err err-not-owner))
+    (err err-vehicle-not-found)))
+
+(define-read-only (get-current-value (vin (string-ascii 17)))
+  (match (map-get? vehicles { vin: vin })
+    vehicle
+      (match (map-get? vehicle-valuations { vin: vin })
+        valuation
+          (let ((age (- stacks-block-height (get initial-registration vehicle)))
+                (accidents 0)) ;; TODO: Implement accident counting logic
+            (ok (- (- (to-int (get initial-value valuation))
+                     (to-int (* age (get annual-depreciation-rate valuation))))
+                  (* accidents (to-int (get accident-penalty valuation))))))
+        (err err-vehicle-not-found))
+    (err err-vehicle-not-found)))
