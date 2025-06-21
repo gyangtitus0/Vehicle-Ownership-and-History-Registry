@@ -343,3 +343,158 @@
                   (* accidents (to-int (get accident-penalty valuation))))))
         (err err-vehicle-not-found))
     (err err-vehicle-not-found)))
+
+
+(define-constant err-claim-exists (err u106))
+(define-constant err-claim-not-found (err u107))
+(define-constant err-invalid-claim-status (err u108))
+(define-constant err-not-insurer (err u109))
+
+(define-map insurance-claims
+  { vin: (string-ascii 17), claim-id: (string-ascii 20) }
+  {
+    insurer: principal,
+    claim-type: (string-ascii 30),
+    claim-amount: uint,
+    claim-status: (string-ascii 20),
+    incident-date: uint,
+    filed-date: uint,
+    resolved-date: (optional uint),
+    payout-amount: (optional uint),
+    description: (string-ascii 300)
+  }
+)
+
+(define-map vehicle-claim-count
+  { vin: (string-ascii 17) }
+  { total-claims: uint, total-payouts: uint }
+)
+
+(define-map authorized-insurers
+  { insurer: principal }
+  { company-name: (string-ascii 100), authorized: bool }
+)
+
+(define-public (authorize-insurer 
+    (insurer principal)
+    (company-name (string-ascii 100)))
+  (if (is-eq tx-sender (var-get contract-owner))
+      (begin
+        (map-set authorized-insurers
+          { insurer: insurer }
+          { company-name: company-name, authorized: true }
+        )
+        (ok true))
+      (err err-not-authorized)))
+
+(define-public (file-insurance-claim
+    (vin (string-ascii 17))
+    (claim-id (string-ascii 20))
+    (claim-type (string-ascii 30))
+    (claim-amount uint)
+    (incident-date uint)
+    (description (string-ascii 300)))
+  (let ((claim-exists (is-some (map-get? insurance-claims { vin: vin, claim-id: claim-id })))
+        (insurer-authorized (default-to false (get authorized (map-get? authorized-insurers { insurer: tx-sender })))))
+    (if (and (not claim-exists) insurer-authorized)
+        (match (map-get? vehicles { vin: vin })
+          vehicle
+            (begin
+              (map-set insurance-claims
+                { vin: vin, claim-id: claim-id }
+                {
+                  insurer: tx-sender,
+                  claim-type: claim-type,
+                  claim-amount: claim-amount,
+                  claim-status: "filed",
+                  incident-date: incident-date,
+                  filed-date: stacks-block-height,
+                  resolved-date: none,
+                  payout-amount: none,
+                  description: description
+                }
+              )
+              (let ((current-count (default-to { total-claims: u0, total-payouts: u0 } 
+                                              (map-get? vehicle-claim-count { vin: vin }))))
+                (map-set vehicle-claim-count
+                  { vin: vin }
+                  { 
+                    total-claims: (+ (get total-claims current-count) u1),
+                    total-payouts: (get total-payouts current-count)
+                  }
+                ))
+                ;; (map-set vehicle-history
+                ;;   { vin: vin, timestamp: stacks-block-height }
+                ;;   {
+                ;;     event-type: "insurance-claim",
+                ;;     previous-owner: none,
+                ;;     new-owner: none,
+                ;;     previous-odometer: none,
+                ;;     new-odometer: none,
+                ;;     service-description: (some description),
+                ;;     accident-description: none
+                ;;   }
+                ;; )
+              (ok true))
+          (err err-vehicle-not-found))
+        (if claim-exists
+            (err err-claim-exists)
+            (err err-not-insurer)))))
+
+(define-public (update-claim-status
+    (vin (string-ascii 17))
+    (claim-id (string-ascii 20))
+    (new-status (string-ascii 20))
+    (payout-amount (optional uint)))
+  (match (map-get? insurance-claims { vin: vin, claim-id: claim-id })
+    claim
+      (if (is-eq tx-sender (get insurer claim))
+          (let ((resolved-date (if (or (is-eq new-status "approved") (is-eq new-status "denied"))
+                                   (some stacks-block-height)
+                                   none)))
+            (map-set insurance-claims
+              { vin: vin, claim-id: claim-id }
+              (merge claim {
+                claim-status: new-status,
+                resolved-date: resolved-date,
+                payout-amount: payout-amount
+              })
+            )
+            (match payout-amount
+              payout
+                (let ((current-count (default-to { total-claims: u0, total-payouts: u0 } 
+                                                (map-get? vehicle-claim-count { vin: vin }))))
+                  (map-set vehicle-claim-count
+                    { vin: vin }
+                    { 
+                      total-claims: (get total-claims current-count),
+                      total-payouts: (+ (get total-payouts current-count) payout)
+                    }
+                  ))
+              true)
+            (ok true))
+          (err err-not-insurer))
+    (err err-claim-not-found)))
+
+(define-read-only (get-insurance-claim 
+    (vin (string-ascii 17))
+    (claim-id (string-ascii 20)))
+  (match (map-get? insurance-claims { vin: vin, claim-id: claim-id })
+    claim (ok claim)
+    (err err-claim-not-found)))
+
+(define-read-only (get-vehicle-claim-summary (vin (string-ascii 17)))
+  (match (map-get? vehicle-claim-count { vin: vin })
+    summary (ok summary)
+    (ok { total-claims: u0, total-payouts: u0 })))
+
+(define-read-only (is-authorized-insurer (insurer principal))
+  (default-to false (get authorized (map-get? authorized-insurers { insurer: insurer }))))
+
+(define-read-only (get-claim-impact-on-value (vin (string-ascii 17)))
+  (match (map-get? vehicle-claim-count { vin: vin })
+    summary 
+      (let ((claim-penalty (* (get total-claims summary) u1000))
+            (payout-penalty (/ (get total-payouts summary) u10)))
+        (ok (+ claim-penalty payout-penalty)))
+    (ok u0)))
