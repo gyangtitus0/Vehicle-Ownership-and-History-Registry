@@ -123,39 +123,42 @@
     vehicle 
       (if (is-eq tx-sender (get owner vehicle))
           (if (>= current-odometer (get current-odometer vehicle))
-              (begin
-                (map-set vehicle-owners
-                  { vin: vin, owner: tx-sender }
-                  { 
-                    ownership-start: (get ownership-start (unwrap-panic (map-get? vehicle-owners { vin: vin, owner: tx-sender }))),
-                    ownership-end: (some stacks-block-height)
-                  }
-                )
-                (map-set vehicle-owners
-                  { vin: vin, owner: new-owner }
-                  { ownership-start: stacks-block-height, ownership-end: none }
-                )
-                (map-set vehicles
-                  { vin: vin }
-                  (merge vehicle { 
-                    owner: new-owner,
-                    current-odometer: current-odometer
-                  })
-                )
-                (map-set vehicle-history
-                  { vin: vin, timestamp: stacks-block-height }
-                  {
-                    event-type: "transfer",
-                    previous-owner: (some tx-sender),
-                    new-owner: (some new-owner),
-                    previous-odometer: (some (get current-odometer vehicle)),
-                    new-odometer: (some current-odometer),
-                    service-description: none,
-                    accident-description: none
-                  }
-                )
-                (ok true)
-              )
+              (let ((liens-check (unwrap-panic (has-active-liens vin))))
+                (if liens-check
+                    (err err-has-active-lien)
+                    (begin
+                      (map-set vehicle-owners
+                        { vin: vin, owner: tx-sender }
+                        { 
+                          ownership-start: (get ownership-start (unwrap-panic (map-get? vehicle-owners { vin: vin, owner: tx-sender }))),
+                          ownership-end: (some stacks-block-height)
+                        }
+                      )
+                      (map-set vehicle-owners
+                        { vin: vin, owner: new-owner }
+                        { ownership-start: stacks-block-height, ownership-end: none }
+                      )
+                      (map-set vehicles
+                        { vin: vin }
+                        (merge vehicle { 
+                          owner: new-owner,
+                          current-odometer: current-odometer
+                        })
+                      )
+                      (map-set vehicle-history
+                        { vin: vin, timestamp: stacks-block-height }
+                        {
+                          event-type: "transfer",
+                          previous-owner: (some tx-sender),
+                          new-owner: (some new-owner),
+                          previous-odometer: (some (get current-odometer vehicle)),
+                          new-odometer: (some current-odometer),
+                          service-description: none,
+                          accident-description: none
+                        }
+                      )
+                      (ok true)
+                    )))
               (err err-invalid-odometer)
           )
           (err err-not-owner)
@@ -349,6 +352,11 @@
 (define-constant err-claim-not-found (err u107))
 (define-constant err-invalid-claim-status (err u108))
 (define-constant err-not-insurer (err u109))
+(define-constant err-lien-exists (err u110))
+(define-constant err-lien-not-found (err u111))
+(define-constant err-not-lienholder (err u112))
+(define-constant err-has-active-lien (err u113))
+(define-constant err-not-authorized-lender (err u114))
 
 (define-map insurance-claims
   { vin: (string-ascii 17), claim-id: (string-ascii 20) }
@@ -498,3 +506,155 @@
             (payout-penalty (/ (get total-payouts summary) u10)))
         (ok (+ claim-penalty payout-penalty)))
     (ok u0)))
+
+(define-map vehicle-liens
+  { vin: (string-ascii 17), lien-id: (string-ascii 20) }
+  {
+    lienholder: principal,
+    loan-amount: uint,
+    interest-rate: uint,
+    start-date: uint,
+    maturity-date: uint,
+    remaining-balance: uint,
+    status: (string-ascii 20),
+    lien-priority: uint
+  }
+)
+
+(define-map authorized-lenders
+  { lender: principal }
+  { 
+    institution-name: (string-ascii 100),
+    authorized: bool,
+    license-number: (string-ascii 50)
+  }
+)
+
+(define-map vehicle-lien-count
+  { vin: (string-ascii 17) }
+  { active-liens: uint, satisfied-liens: uint }
+)
+
+(define-public (authorize-lender
+    (lender principal)
+    (institution-name (string-ascii 100))
+    (license-number (string-ascii 50)))
+  (if (is-eq tx-sender (var-get contract-owner))
+      (begin
+        (map-set authorized-lenders
+          { lender: lender }
+          { 
+            institution-name: institution-name,
+            authorized: true,
+            license-number: license-number
+          }
+        )
+        (ok true))
+      (err err-not-authorized)))
+
+(define-public (register-lien
+    (vin (string-ascii 17))
+    (lien-id (string-ascii 20))
+    (loan-amount uint)
+    (interest-rate uint)
+    (maturity-date uint)
+    (lien-priority uint))
+  (let ((lien-exists (is-some (map-get? vehicle-liens { vin: vin, lien-id: lien-id })))
+        (lender-authorized (default-to false (get authorized (map-get? authorized-lenders { lender: tx-sender })))))
+    (if (and (not lien-exists) lender-authorized)
+        (match (map-get? vehicles { vin: vin })
+          vehicle
+            (begin
+              (map-set vehicle-liens
+                { vin: vin, lien-id: lien-id }
+                {
+                  lienholder: tx-sender,
+                  loan-amount: loan-amount,
+                  interest-rate: interest-rate,
+                  start-date: stacks-block-height,
+                  maturity-date: maturity-date,
+                  remaining-balance: loan-amount,
+                  status: "active",
+                  lien-priority: lien-priority
+                }
+              )
+              (let ((current-count (default-to { active-liens: u0, satisfied-liens: u0 } 
+                                              (map-get? vehicle-lien-count { vin: vin }))))
+                (map-set vehicle-lien-count
+                  { vin: vin }
+                  { 
+                    active-liens: (+ (get active-liens current-count) u1),
+                    satisfied-liens: (get satisfied-liens current-count)
+                  }
+                ))
+              (ok true))
+          (err err-vehicle-not-found))
+        (if lien-exists
+            (err err-lien-exists)
+            (err err-not-authorized-lender)))))
+
+(define-public (update-lien-balance
+    (vin (string-ascii 17))
+    (lien-id (string-ascii 20))
+    (new-balance uint))
+  (match (map-get? vehicle-liens { vin: vin, lien-id: lien-id })
+    lien
+      (if (is-eq tx-sender (get lienholder lien))
+          (begin
+            (map-set vehicle-liens
+              { vin: vin, lien-id: lien-id }
+              (merge lien { remaining-balance: new-balance })
+            )
+            (ok true))
+          (err err-not-lienholder))
+    (err err-lien-not-found)))
+
+(define-public (satisfy-lien
+    (vin (string-ascii 17))
+    (lien-id (string-ascii 20)))
+  (match (map-get? vehicle-liens { vin: vin, lien-id: lien-id })
+    lien
+      (if (is-eq tx-sender (get lienholder lien))
+          (begin
+            (map-set vehicle-liens
+              { vin: vin, lien-id: lien-id }
+              (merge lien { 
+                remaining-balance: u0,
+                status: "satisfied"
+              })
+            )
+            (let ((current-count (default-to { active-liens: u0, satisfied-liens: u0 } 
+                                            (map-get? vehicle-lien-count { vin: vin }))))
+              (map-set vehicle-lien-count
+                { vin: vin }
+                { 
+                  active-liens: (- (get active-liens current-count) u1),
+                  satisfied-liens: (+ (get satisfied-liens current-count) u1)
+                }
+              ))
+            (ok true))
+          (err err-not-lienholder))
+    (err err-lien-not-found)))
+
+(define-read-only (get-vehicle-lien
+    (vin (string-ascii 17))
+    (lien-id (string-ascii 20)))
+  (match (map-get? vehicle-liens { vin: vin, lien-id: lien-id })
+    lien (ok lien)
+    (err err-lien-not-found)))
+
+(define-read-only (get-vehicle-lien-summary (vin (string-ascii 17)))
+  (match (map-get? vehicle-lien-count { vin: vin })
+    summary (ok summary)
+    (ok { active-liens: u0, satisfied-liens: u0 })))
+
+(define-read-only (has-active-liens (vin (string-ascii 17)))
+  (match (map-get? vehicle-lien-count { vin: vin })
+    summary (ok (> (get active-liens summary) u0))
+    (ok false)))
+
+(define-read-only (is-authorized-lender (lender principal))
+  (default-to false (get authorized (map-get? authorized-lenders { lender: lender }))))
+
+(define-read-only (calculate-total-lien-value (vin (string-ascii 17)))
+  (ok u0))
