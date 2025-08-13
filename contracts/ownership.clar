@@ -123,10 +123,13 @@
     vehicle 
       (if (is-eq tx-sender (get owner vehicle))
           (if (>= current-odometer (get current-odometer vehicle))
-              (let ((liens-check (unwrap-panic (has-active-liens vin))))
+              (let ((liens-check (unwrap-panic (has-active-liens vin)))
+                    (compliance-check (unwrap-panic (check-transfer-compliance vin))))
                 (if liens-check
                     (err err-has-active-lien)
-                    (begin
+                    (if (not compliance-check)
+                        (err err-compliance-violation)
+                        (begin
                       (map-set vehicle-owners
                         { vin: vin, owner: tx-sender }
                         { 
@@ -158,7 +161,7 @@
                         }
                       )
                       (ok true)
-                    )))
+                      ))))
               (err err-invalid-odometer)
           )
           (err err-not-owner)
@@ -357,6 +360,12 @@
 (define-constant err-not-lienholder (err u112))
 (define-constant err-has-active-lien (err u113))
 (define-constant err-not-authorized-lender (err u114))
+(define-constant err-inspection-exists (err u115))
+(define-constant err-inspection-not-found (err u116))
+(define-constant err-not-authorized-facility (err u117))
+(define-constant err-inspection-expired (err u118))
+(define-constant err-invalid-inspection-date (err u119))
+(define-constant err-compliance-violation (err u120))
 
 (define-map insurance-claims
   { vin: (string-ascii 17), claim-id: (string-ascii 20) }
@@ -658,3 +667,235 @@
 
 (define-read-only (calculate-total-lien-value (vin (string-ascii 17)))
   (ok u0))
+
+;; Vehicle Inspection and Compliance Tracking System
+(define-map vehicle-inspections
+  { vin: (string-ascii 17), inspection-id: (string-ascii 25) }
+  {
+    facility: principal,
+    inspection-type: (string-ascii 30),
+    inspection-date: uint,
+    expiration-date: uint,
+    odometer-reading: uint,
+    result-status: (string-ascii 20),
+    violations-found: (string-ascii 500),
+    inspector-certification: (string-ascii 50),
+    fees-paid: uint
+  }
+)
+
+(define-map authorized-inspection-facilities
+  { facility: principal }
+  {
+    facility-name: (string-ascii 100),
+    facility-address: (string-ascii 200),
+    license-number: (string-ascii 30),
+    authorized-types: (string-ascii 100),
+    certification-expiry: uint,
+    authorized: bool
+  }
+)
+
+(define-map vehicle-compliance-status
+  { vin: (string-ascii 17) }
+  {
+    safety-inspection-current: bool,
+    emissions-inspection-current: bool,
+    registration-current: bool,
+    last-safety-check: uint,
+    last-emissions-check: uint,
+    last-registration-renewal: uint,
+    total-violations: uint,
+    compliance-score: uint
+  }
+)
+
+(define-map inspection-type-requirements
+  { inspection-type: (string-ascii 30) }
+  {
+    validity-period: uint,
+    mandatory-for-transfer: bool,
+    fee-amount: uint,
+    required-certifications: (string-ascii 100)
+  }
+)
+
+;; Authorize inspection facility
+(define-public (authorize-inspection-facility
+    (facility principal)
+    (facility-name (string-ascii 100))
+    (facility-address (string-ascii 200))
+    (license-number (string-ascii 30))
+    (authorized-types (string-ascii 100))
+    (certification-expiry uint))
+  (if (is-eq tx-sender (var-get contract-owner))
+      (begin
+        (map-set authorized-inspection-facilities
+          { facility: facility }
+          {
+            facility-name: facility-name,
+            facility-address: facility-address,
+            license-number: license-number,
+            authorized-types: authorized-types,
+            certification-expiry: certification-expiry,
+            authorized: true
+          }
+        )
+        (ok true))
+      (err err-not-authorized)))
+
+;; Set inspection type requirements
+(define-public (set-inspection-requirements
+    (inspection-type (string-ascii 30))
+    (validity-period uint)
+    (mandatory-for-transfer bool)
+    (fee-amount uint)
+    (required-certifications (string-ascii 100)))
+  (if (is-eq tx-sender (var-get contract-owner))
+      (begin
+        (map-set inspection-type-requirements
+          { inspection-type: inspection-type }
+          {
+            validity-period: validity-period,
+            mandatory-for-transfer: mandatory-for-transfer,
+            fee-amount: fee-amount,
+            required-certifications: required-certifications
+          }
+        )
+        (ok true))
+      (err err-not-authorized)))
+
+;; Record vehicle inspection
+(define-public (record-vehicle-inspection
+    (vin (string-ascii 17))
+    (inspection-id (string-ascii 25))
+    (inspection-type (string-ascii 30))
+    (expiration-date uint)
+    (odometer-reading uint)
+    (result-status (string-ascii 20))
+    (violations-found (string-ascii 500))
+    (inspector-certification (string-ascii 50))
+    (fees-paid uint))
+  (let ((inspection-exists (is-some (map-get? vehicle-inspections { vin: vin, inspection-id: inspection-id })))
+        (facility-authorized (default-to false (get authorized (map-get? authorized-inspection-facilities { facility: tx-sender })))))
+    (if (and (not inspection-exists) facility-authorized)
+        (match (map-get? vehicles { vin: vin })
+          vehicle
+            (if (>= odometer-reading (get current-odometer vehicle))
+                (begin
+                  ;; Record the inspection
+                  (map-set vehicle-inspections
+                    { vin: vin, inspection-id: inspection-id }
+                    {
+                      facility: tx-sender,
+                      inspection-type: inspection-type,
+                      inspection-date: stacks-block-height,
+                      expiration-date: expiration-date,
+                      odometer-reading: odometer-reading,
+                      result-status: result-status,
+                      violations-found: violations-found,
+                      inspector-certification: inspector-certification,
+                      fees-paid: fees-paid
+                    }
+                  )
+                  ;; Update compliance status
+                  (let ((current-compliance (default-to 
+                                           { safety-inspection-current: false,
+                                             emissions-inspection-current: false,
+                                             registration-current: false,
+                                             last-safety-check: u0,
+                                             last-emissions-check: u0,
+                                             last-registration-renewal: u0,
+                                             total-violations: u0,
+                                             compliance-score: u0 }
+                                           (map-get? vehicle-compliance-status { vin: vin }))))
+                    (map-set vehicle-compliance-status
+                      { vin: vin }
+                      (if (is-eq inspection-type "safety")
+                          (merge current-compliance {
+                            safety-inspection-current: (is-eq result-status "pass"),
+                            last-safety-check: stacks-block-height
+                          })
+                          (if (is-eq inspection-type "emissions")
+                              (merge current-compliance {
+                                emissions-inspection-current: (is-eq result-status "pass"),
+                                last-emissions-check: stacks-block-height
+                              })
+                              current-compliance))))
+                  ;; Add to vehicle history
+                  (map-set vehicle-history
+                    { vin: vin, timestamp: stacks-block-height }
+                    {
+                      event-type: "inspection",
+                      previous-owner: none,
+                      new-owner: none,
+                      previous-odometer: (some (get current-odometer vehicle)),
+                      new-odometer: (some odometer-reading),
+                      service-description: (some inspection-type),
+                      accident-description: none
+                    }
+                  )
+                  (ok true))
+                (err err-invalid-odometer))
+          (err err-vehicle-not-found))
+        (if inspection-exists
+            (err err-inspection-exists)
+            (err err-not-authorized-facility)))))
+
+;; Check vehicle compliance status
+(define-read-only (get-vehicle-compliance (vin (string-ascii 17)))
+  (match (map-get? vehicle-compliance-status { vin: vin })
+    compliance (ok compliance)
+    (ok { safety-inspection-current: false,
+          emissions-inspection-current: false,
+          registration-current: false,
+          last-safety-check: u0,
+          last-emissions-check: u0,
+          last-registration-renewal: u0,
+          total-violations: u0,
+          compliance-score: u0 })))
+
+;; Check if vehicle meets transfer compliance requirements
+(define-read-only (check-transfer-compliance (vin (string-ascii 17)))
+  (match (map-get? vehicle-compliance-status { vin: vin })
+    compliance 
+      (let ((safety-ok (get safety-inspection-current compliance))
+            (emissions-ok (get emissions-inspection-current compliance)))
+        (ok (and safety-ok emissions-ok)))
+    (ok false)))
+
+;; Get inspection details
+(define-read-only (get-vehicle-inspection
+    (vin (string-ascii 17))
+    (inspection-id (string-ascii 25)))
+  (match (map-get? vehicle-inspections { vin: vin, inspection-id: inspection-id })
+    inspection (ok inspection)
+    (err err-inspection-not-found)))
+
+;; Check facility authorization
+(define-read-only (is-authorized-inspection-facility (facility principal))
+  (default-to false (get authorized (map-get? authorized-inspection-facilities { facility: facility }))))
+
+;; Get inspection requirements for type
+(define-read-only (get-inspection-requirements (inspection-type (string-ascii 30)))
+  (match (map-get? inspection-type-requirements { inspection-type: inspection-type })
+    requirements (ok requirements)
+    (err err-inspection-not-found)))
+
+;; Calculate compliance score
+(define-read-only (calculate-compliance-score (vin (string-ascii 17)))
+  (match (map-get? vehicle-compliance-status { vin: vin })
+    compliance
+      (let ((safety-points (if (get safety-inspection-current compliance) u30 u0))
+            (emissions-points (if (get emissions-inspection-current compliance) u30 u0))
+            (registration-points (if (get registration-current compliance) u20 u0))
+            (violation-penalty (* (get total-violations compliance) u5)))
+        (ok (- (+ safety-points emissions-points registration-points) violation-penalty)))
+    (ok u0)))
+
+
+
+
+
+
+    
